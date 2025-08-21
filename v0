@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+import os
+import sys
+from decimal import Decimal, InvalidOperation
+import ccxt
+
+"""
+Environment variables expected:
+  HYPERLIQUID_WALLET_ADDRESS   -> your agent wallet address (0x...)
+  HYPERLIQUID_PRIVATE_KEY      -> your agent private key (0x...)
+  HYPERLIQUID_DEFAULT_SLIPPAGE -> e.g. "0.05" for 5% (used for market TP/SL)
+  HYPERLIQUID_TESTNET          -> "1" to use testnet (default), "0" for mainnet
+"""
+
+def env_required(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(f"Missing environment variable: {name}")
+    return val
+
+def parse_decimal(name: str, s: str) -> Decimal:
+    try:
+        return Decimal(str(s))
+    except (InvalidOperation, TypeError):
+        raise RuntimeError(f"Invalid decimal for {name}: {s}")
+
+def find_perp_symbol(exchange: ccxt.Exchange, base_ticker: str) -> str:
+    """
+    Hyperliquid perps are USDC-settled; we find the swap market whose base matches the ticker.
+    Examples often look like 'ETH/USDC:USDC'.
+    """
+    base_ticker = base_ticker.upper().strip()
+    exchange.load_markets()
+    for m in exchange.markets.values():
+        if m.get('swap') and m.get('base') == base_ticker:
+            return m['symbol']
+    # Helpful error if not found
+    available = sorted({(m['base'], m['symbol']) for m in exchange.markets.values() if m.get('swap')})
+    raise RuntimeError(f"No Hyperliquid perp found for base '{base_ticker}'. "
+                       f"Available bases include: {sorted({b for b,_ in available})}")
+
+def place_bracket_limit_order(
+    base: str,
+    amount: str,
+    limit_price: str,
+    tp_price: str,
+    sl_price: str,
+    reduce_only: bool = False
+):
+    # --- Credentials & exchange setup ---
+    wallet = env_required("HYPERLIQUID_WALLET_ADDRESS")
+    pkey   = env_required("HYPERLIQUID_PRIVATE_KEY")
+    slip   = os.getenv("HYPERLIQUID_DEFAULT_SLIPPAGE", "0.05")  # 5% default
+    try:
+        # validate slippage number early
+        _ = float(slip)
+    except Exception:
+        raise RuntimeError(f"Invalid HYPERLIQUID_DEFAULT_SLIPPAGE: {slip}")
+
+    use_testnet = os.getenv("HYPERLIQUID_TESTNET", "1") != "0"
+
+    exchange = ccxt.hyperliquid({
+        "walletAddress": wallet,
+        "privateKey": pkey,
+        "options": {
+            # CCXT also looks at options.defaultSlippage internally for market triggers
+            "defaultSlippage": float(slip),
+        },
+    })
+    exchange.set_sandbox_mode(use_testnet)  # testnet first, as requested
+
+    # Cross margin (Hyperliquid perps are cross by default; calling for clarity)
+    try:
+        exchange.set_margin_mode("cross")
+    except Exception:
+        # If not supported per-market, ignore
+        pass
+
+    symbol = find_perp_symbol(exchange, base)
+
+    # --- Inputs & side logic ---
+    amt = parse_decimal("amount", amount)
+    px  = parse_decimal("limit_price", limit_price)
+    tp  = parse_decimal("tp_price", tp_price)
+    sl  = parse_decimal("sl_price", sl_price)
+
+    if amt == 0:
+        raise RuntimeError("Order size must be non-zero.")
+
+    side = "buy" if amt > 0 else "sell"
+    qty  = abs(amt)
+
+    # --- Build parent + attached TP/SL ---
+    #
+    # IMPORTANT for HL via CCXT:
+    # - Parent is a LIMIT order.
+    # - Attached TP/SL must be child orders with type "market" and include BOTH:
+    #       triggerPrice -> when to trigger
+    #       price        -> used only to compute the slippage cap for market execution
+    #   This yields "Take Profit Market" and "Stop Market" on the exchange,
+    #   and CCXT groups them as normalTpsl so canceling parent cancels TP/SL. :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
+    #
+    params = {
+        "timeInForce": "Gtc",
+        "reduceOnly": bool(reduce_only),  # parent only; children are forced reduceOnly in CCXT adapter
+        "slippage": str(slip),
+        "takeProfit": {
+            "type": "market",            # -> "Take Profit Market"
+            "triggerPrice": str(tp),     # triggers ABOVE for long (closing sell), BELOW for short (closing buy)
+            "price": str(tp),            # needed so CCXT can compute max slippage price for the market trigger
+        },
+        "stopLoss": {
+            "type": "market",            # -> "Stop Market"
+            "triggerPrice": str(sl),     # triggers BELOW for long, ABOVE for short
+            "price": str(sl),
+        },
+    }
+
+    try:
+        order = exchange.create_order(
+            symbol=symbol,
+            type="limit",
+            side=side,
+            amount=float(qty),
+            price=float(px),
+            params=params,
+        )
+        # CCXT returns a parsed order for the parent; children are created in the same call.
+        print("✅ Placed parent limit with attached TP (Market) & SL (Market):")
+        print(order)
+    except ccxt.BaseError as e:
+        # Pass through clean exchange messages
+        raise RuntimeError(f"❌ Error placing order: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 6:
+        print(
+            "Usage:\n"
+            "  python place_bracket.py <TICKER> <AMOUNT> <LIMIT_PRICE> <TP_PRICE> <SL_PRICE>\n\n"
+            "Notes:\n"
+            "  - AMOUNT > 0 => long; AMOUNT < 0 => short\n"
+            "  - Example (testnet):\n"
+            "      python place_bracket.py ETH 0.1 2500 2600 2450\n"
+            "      python place_bracket.py SOL -5 140 135 145\n"
+        )
+        sys.exit(1)
+
+    base   = sys.argv[1]          # e.g. ETH, SOL (no slash)
+    amount = sys.argv[2]          # signed string, e.g. "0.1" or "-5"
+    limitp = sys.argv[3]
+    tpp    = sys.argv[4]
+    slp    = sys.argv[5]
+
+    place_bracket_limit_order(base, amount, limitp, tpp, slp, reduce_only=False)
