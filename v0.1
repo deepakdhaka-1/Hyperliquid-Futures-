@@ -1,0 +1,117 @@
+import os
+import ccxt
+from dotenv import load_dotenv
+from datetime import datetime
+
+# Load environment variables
+load_dotenv()
+
+# Initialize exchange
+exchange = ccxt.hyperliquid({
+    'walletAddress': os.getenv('HYPERLIQUID_WALLET_ADDRESS'),
+    'privateKey': os.getenv('HYPERLIQUID_PRIVATE_KEY'),
+    'enableRateLimit': True,
+})
+
+# Config
+DEFAULT_LEVERAGE = int(os.getenv('DEFAULT_LEVERAGE', '2'))
+SLIPPAGE_PCT = float(os.getenv('SLIPPAGE_PCT', '0.005'))  # 0.5% slippage
+POSITION_TYPE = os.getenv('TYPE', 'cross').lower()  # 'cross' or 'isolated'
+
+def print_banner():
+    print("✨" * 50)
+    print(f"🚀 HYPERLIQUID TERMINAL TRADER".center(50))
+    print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}".center(50))
+    print("✨" * 50)
+    print(f"\n📌 Enter command (e.g., hype buy 1)")
+    print(f"💡 Type 'exit' to quit\n")
+
+def execute_market_order(ticker, side, amount):
+    """Execute market order immediately with beautiful output"""
+    symbol = f"{ticker}/USDC:USDC"
+
+    try:
+        # Set margin mode and leverage in one call (required by Hyperliquid)
+        exchange.set_margin_mode(POSITION_TYPE, symbol, {'leverage': DEFAULT_LEVERAGE})
+
+        # Get market price
+        ticker_data = exchange.fetch_ticker(symbol)
+        mark_price = float(ticker_data['info']['markPx'])
+
+        # Calculate limit price with slippage
+        limit_price = round(
+            mark_price * (1 + SLIPPAGE_PCT) if side == 'buy' else mark_price * (1 - SLIPPAGE_PCT),
+            4
+        )
+
+        # Execute order
+        print("\n🔄 Processing your order...")
+        order = exchange.create_order(
+            symbol=symbol,
+            type="market",
+            side=side,
+            amount=amount,
+            price=limit_price
+        )
+
+        # Get execution details
+        exec_price = float(order['average']) if 'average' in order else mark_price
+        price_diff = exec_price - mark_price
+        price_diff_pct = abs(price_diff / mark_price) * 100
+
+        # Beautiful output
+        print("\n" + "✅ ORDER EXECUTED SUCCESSFULLY".center(50, "━"))
+        print(f"│ {'• Pair:':<15} {ticker.upper()}/USDC")
+        print(f"│ {'• Side:':<15} {side.upper()}")
+        print(f"│ {'• Amount:':<15} {amount}")
+        print(f"│ {'• Mark Price:':<15} {mark_price:.4f}")
+        print(f"│ {'• Executed At:':<15} {exec_price:.4f}")
+        print(f"│ {'• Price Diff:':<15} {price_diff:+.4f} ({price_diff_pct:.2f}%)")
+        print(f"│ {'• Order ID:':<15} {order['id']}")
+        print("━" * 50 + "\n")
+
+    except Exception as e:
+        print(f"\n❌ ORDER FAILED: {str(e)}\n")
+
+# Main program
+print_banner()
+
+while True:
+    try:
+        cmd = input("💬 > ").strip()
+        if not cmd:
+            continue
+        if cmd.lower() == 'exit':
+            break
+
+        parts = cmd.split()
+        if len(parts) != 3:
+            print("\n⚠️ Invalid format! Use: TICKER SIDE AMOUNT")
+            print("💡 Example: hype buy 1\n")
+            continue
+
+        ticker, side, amount = parts
+        side = side.lower()
+
+        if side not in ['buy', 'sell']:
+            print("\n⚠️ Invalid side! Must be 'buy' or 'sell'\n")
+            continue
+
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                print("\n⚠️ Amount must be positive!\n")
+                continue
+
+            execute_market_order(ticker.upper(), side, amount)
+        except ValueError:
+            print("\n⚠️ Amount must be a valid number!\n")
+
+    except KeyboardInterrupt:
+        print("\n🛑 Received exit command...")
+        break
+    except Exception as e:
+        print(f"\n⚠️ Unexpected error: {e}\n")
+
+print("\n" + "✨ Thank you for trading with HyperLiquid! ✨".center(50))
+print(f"⏰ Session ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
