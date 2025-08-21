@@ -1,0 +1,219 @@
+import os
+import ccxt
+from dotenv import load_dotenv
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+import time
+from colorama import init, Fore, Style
+
+# === Init Colorama ===
+init(autoreset=True)
+
+# === Debug Function ===
+def debug_print(message):
+    print(Fore.YELLOW + f"[DEBUG] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}")
+
+# === Load Agent API credentials + defaults from .env ===
+try:
+    debug_print("Loading .env file")
+    load_dotenv()
+    wallet_address = os.getenv("HL_WALLET_ADDRESS")
+    private_key = os.getenv("HL_PRIVATE_KEY")
+    default_slippage = float(os.getenv("HL_DEFAULT_SLIPPAGE", "0.05"))
+    margin_mode = os.getenv("HL_MARGIN_MODE", "isolated")
+    default_leverage = os.getenv("HL_DEFAULT_LEVERAGE", "10")
+
+    debug_print(f"Env vars: wallet_address={wallet_address[:4]}..., slippage={default_slippage}, margin_mode={margin_mode}, leverage={default_leverage}")
+
+    if not wallet_address or not private_key:
+        raise ValueError(Fore.RED + "❌ Missing HL_WALLET_ADDRESS or HL_PRIVATE_KEY in .env file")
+    if margin_mode not in ["isolated", "cross"]:
+        raise ValueError(Fore.RED + f"❌ Invalid HL_MARGIN_MODE: {margin_mode}. Must be 'isolated' or 'cross'")
+    try:
+        default_leverage = float(default_leverage)
+        if default_leverage <= 0:
+            raise ValueError
+    except ValueError:
+        raise ValueError(Fore.RED + f"❌ Invalid HL_DEFAULT_LEVERAGE: {default_leverage}. Must be a positive number")
+except Exception as e:
+    debug_print(f"Error loading .env: {e}")
+    raise
+
+# === Google Sheets Setup ===
+SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/16DTT-YDHUBelC7JZcodvNI9fx7ttM43IQqzRqP7YTc4/edit?gid=0"
+SHEET_LIVE = "Live Position"
+SHEET_EXEC = "Trade Execution"
+
+try:
+    debug_print("Setting up Google Sheets")
+    creds = Credentials.from_service_account_file(
+        "creds.json",
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(SPREADSHEET_URL)
+    debug_print("Google Sheets connected")
+except Exception as e:
+    debug_print(f"Error setting up Google Sheets: {e}")
+    raise
+
+# === Init Hyperliquid Exchange ===
+try:
+    debug_print("Initializing Hyperliquid exchange")
+    exchange = ccxt.hyperliquid({
+        'walletAddress': wallet_address,
+        'privateKey': private_key,
+        'enableRateLimit': True,
+        'options': {
+            'defaultSlippage': default_slippage
+        }
+    })
+    exchange.set_sandbox_mode(True)
+    asset = "ETH"
+    symbol = f"{asset}/USDC:USDC"
+    exchange.setMarginMode(margin_mode, symbol, {'leverage': str(default_leverage)})
+    debug_print(f"Exchange initialized: margin_mode={margin_mode}, leverage={default_leverage}")
+except Exception as e:
+    debug_print(f"Error initializing exchange: {e}")
+    raise
+
+# === Print Header ===
+def print_header():
+    print(Fore.CYAN + Style.BRIGHT + "="*70)
+    print(Fore.MAGENTA + Style.BRIGHT + f"      🔥 Hyperliquid Auto-Trading Bot (Margin: {margin_mode}, Leverage: {default_leverage}x) 🔥")
+    print(Fore.CYAN + Style.BRIGHT + "="*70)
+
+# === Fetch last executed SL from Trade Execution ===
+last_sl_cache = None  # Cache to reduce sheet reads
+def get_last_executed_sl():
+    global last_sl_cache
+    try:
+        debug_print("Fetching last stop-loss")
+        exec_ws = sh.worksheet(SHEET_EXEC)
+        col_E = exec_ws.col_values(5)
+        if len(col_E) > 1:
+            last_sl_cache = float(col_E[-1])
+        else:
+            last_sl_cache = None
+        return last_sl_cache
+    except Exception as e:
+        debug_print(f"Error fetching last SL: {e}")
+        return last_sl_cache
+
+# === Save Trade Execution to Google Sheet ===
+def log_trade(result, side, amount, limit_price, take_profit, stop_loss, success=True):
+    try:
+        debug_print("Logging trade")
+        exec_ws = sh.worksheet(SHEET_EXEC)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        oid = result[0]["id"] if success and result and isinstance(result, list) and "id" in result[0] else "FAILED"
+        raw_msg = f"""📈 {side.upper()} {abs(amount)} ETH
+⏰ {now}
+💰 Limit Px: {limit_price}
+📊 TP: {take_profit} / SL: {stop_loss}
+⚙️ Slippage: ±{default_slippage*100:.1f}%
+🛠 Margin Mode: {margin_mode}
+📈 Leverage: {default_leverage}x
+🆔 Order ID: {oid}
+🔎 Raw: {result}"""
+        exec_ws.append_row([now, amount, limit_price, take_profit, stop_loss, raw_msg])
+        debug_print("Trade logged successfully")
+    except Exception as e:
+        debug_print(f"Error logging trade: {e}")
+
+# === Place TP/SL Orders ===
+def place_order(trade_amount, limit_price, take_profit, stop_loss):
+    try:
+        debug_print(f"Placing order: amount={trade_amount}, limit={limit_price}, TP={take_profit}, SL={stop_loss}")
+        symbol = f"{asset}/USDC:USDC"
+        side = 'buy' if trade_amount > 0 else 'sell'
+        abs_amount = abs(trade_amount)
+        opposite_side = 'sell' if side == 'buy' else 'buy'
+
+        entry_order = {
+            'symbol': symbol,
+            'type': 'limit',
+            'side': side,
+            'price': str(limit_price),
+            'amount': str(abs_amount),
+            'params': {'reduceOnly': False, 'timeInForce': 'Gtc', 'leverage': str(default_leverage)}
+        }
+        tp_order = {
+            'symbol': symbol,
+            'type': 'market',
+            'side': side,
+            'price': str(take_profit),
+            'amount': str(abs_amount),
+            'params': {'triggerPrice': str(take_profit), 'reduceOnly': True, 'isTakeProfit': True}
+        }
+        sl_order = {
+            'symbol': symbol,
+            'type': 'market',
+            'side': opposite_side,
+            'price': str(stop_loss),
+            'amount': str(abs_amount),
+            'params': {'triggerPrice': str(stop_loss), 'reduceOnly': True, 'isStopLoss': True}
+        }
+        orders = [entry_order, tp_order, sl_order]
+        params = {'grouping': 'normalTpsl'}
+
+        print(Fore.CYAN + f"\n🚀 Placing {side.upper()} {trade_amount} ETH at {limit_price} TP {take_profit} SL {stop_loss} (Margin: {margin_mode}, Leverage: {default_leverage}x)")
+        result = exchange.create_orders(orders, params)
+        print(Fore.GREEN + "✅ Orders submitted successfully!")
+        log_trade(result, side, trade_amount, limit_price, take_profit, stop_loss, success=True)
+        global last_sl_cache
+        last_sl_cache = stop_loss  # Update cache after successful order
+        return True
+    except Exception as e:
+        print(Fore.RED + f"❌ Error placing order: {e}")
+        log_trade(str(e), side, trade_amount, limit_price, take_profit, stop_loss, success=False)
+        return False
+
+# === Monitoring Loop ===
+def monitor_orders():
+    print_header()
+    debug_print("Starting monitoring loop")
+    while True:
+        try:
+            debug_print("Reading Live Position sheet")
+            live_ws = sh.worksheet(SHEET_LIVE)
+            # Batch fetch E2:H2
+            cells = live_ws.batch_get(["E2:H2"])[0]
+            e2, f2, g2, h2 = cells[0] if cells and len(cells[0]) == 4 else [None, None, None, None]
+
+            debug_print(f"Sheet values: E2={e2}, F2={f2}, G2={g2}, H2={h2}")
+
+            if not all([e2, f2, g2, h2]):
+                print(Fore.YELLOW + "[WARN] One or more required cells (E2:H2) are empty. Skipping loop...")
+                time.sleep(10)  # Reduced from 60s
+                continue
+
+            trade_amount = float(e2)
+            limit_price = float(f2)
+            take_profit = float(g2)
+            stop_loss = float(h2)
+
+            last_sl = get_last_executed_sl()
+            print(Fore.YELLOW + f"\n[CHECK] Last SL: {last_sl} | Current SL: {stop_loss}")
+
+            if last_sl != stop_loss:
+                print(Fore.MAGENTA + "[NEW ORDER] Detected change in SL, executing trade...")
+                place_order(trade_amount, limit_price, take_profit, stop_loss)
+                time.sleep(5)  # Reduced from 30s
+            else:
+                print(Fore.BLUE + "[WAIT] No new order, checking again in 10s...")
+                time.sleep(10)  # Reduced from 60s
+
+        except Exception as e:
+            print(Fore.RED + f"[ERROR] Monitor loop exception: {e}")
+            time.sleep(10)  # Reduced from 60s
+
+# === Main Execution ===
+if __name__ == "__main__":
+    try:
+        debug_print("Script started")
+        monitor_orders()
+    except Exception as e:
+        debug_print(f"Top-level error: {e}")
+        raise
