@@ -82,3 +82,14 @@ while True:
     check_and_cancel()
     print("✅ Cycle complete. Sleeping 60 seconds...\n")
     time.sleep(60)
+
+
+#nano .env content -> # Wallets
+#HL_wallet_address1=0xYourWallet1
+#HL_privatekey_1=yourprivatekey1
+#HL_wallet_address2=0xYourWallet2
+#HL_privatekey_2=yourprivatekey2
+# add more in same format...
+
+# Tickers to monitor
+#HL_TICKERS=ETH,BTC,SOL
