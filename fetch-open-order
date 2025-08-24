@@ -1,0 +1,47 @@
+import os
+from dotenv import load_dotenv
+import ccxt
+
+# Load .env variables
+load_dotenv()
+HL_PRIVATE_KEY = os.getenv("HL_PRIVATE_KEY")
+HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS")
+
+if not HL_PRIVATE_KEY or not HL_WALLET_ADDRESS:
+    raise ValueError("Missing HL_PRIVATE_KEY or HL_WALLET_ADDRESS in .env file")
+
+# Ask user if testnet should be used
+use_testnet = input("Use Testnet? (y/n): ").strip().lower() == "y"
+
+# Initialize exchange
+exchange = ccxt.hyperliquid({
+    "walletAddress": HL_WALLET_ADDRESS,
+    "privateKey": HL_PRIVATE_KEY,
+})
+
+# Switch to testnet if selected
+exchange.set_sandbox_mode(use_testnet)
+print(f"Connected to {'Testnet' if use_testnet else 'Mainnet'} ✅")
+
+# Ask user for ticker
+ticker = input("Enter ticker (example: ETH/USDC:USDC or SOL/USDC:USDC): ").strip()
+
+# Fetch open orders
+try:
+    open_orders = exchange.fetch_open_orders(
+        symbol=ticker,
+        params={"user": HL_WALLET_ADDRESS}  # Force wallet address
+    )
+
+    # Filter unfilled orders (remaining > 0)
+    unfilled_orders = [order for order in open_orders if float(order.get("remaining", 0)) > 0]
+
+    print("\n=== RAW RESPONSE (Open Unfilled Orders) ===")
+    for order in unfilled_orders:
+        print(order)
+
+    if not unfilled_orders:
+        print("No unfilled open orders found.")
+
+except Exception as e:
+    print("Error fetching open orders:", e)
